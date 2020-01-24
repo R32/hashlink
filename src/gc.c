@@ -60,9 +60,15 @@ static int_val gc_hash( void *ptr ) {
 
 #endif
 
+// 1<<16==64KB, 单个页的默认大小值, 在回收时可方便地定位某个指针所属哪一个页
 #define GC_MASK_BITS		16
+
+// hl_gc_page_map[256][256] 的第一层, 即 map[256], 在这一层需要初使化第二层所有元素为 NULL
 #define GC_GET_LEVEL1(ptr)	hl_gc_page_map[gc_hash(ptr)>>(GC_MASK_BITS+GC_LEVEL1_BITS)]
+
+// 第二层, 即 (map[256])[256] 将指向一个 64KB 的页
 #define GC_GET_PAGE(ptr)	GC_GET_LEVEL1(ptr)[(gc_hash(ptr)>>GC_MASK_BITS)&GC_LEVEL1_MASK]
+
 #define GC_LEVEL1_MASK		((1 << GC_LEVEL1_BITS) - 1)
 
 #define PAGE_KIND_BITS		2
@@ -344,8 +350,9 @@ static void *gc_alloc_page_memory( int size );
 static gc_pheader *gc_alloc_page( int size, int kind, int block_count ) {
 	unsigned char *base = (unsigned char*)gc_alloc_page_memory(size);
 	if( !base ) {
+		// 分配出错, 则执行 GC 以回收垃圾
 		int pages = gc_stats.pages_allocated;
-		gc_major();
+		gc_major(); // TODO: 好像没有加 global 锁
 		if( pages != gc_stats.pages_allocated )
 			return gc_alloc_page(size, kind, block_count);
 		// big block : report stack trace - we should manage to handle it
@@ -396,7 +403,7 @@ static gc_pheader *gc_alloc_page( int size, int kind, int block_count ) {
 #	endif
 	if( ((int_val)base) & ((1<<GC_MASK_BITS) - 1) )
 		hl_fatal("Page memory is not correctly aligned");
-	p->page_size = size;
+	p->page_size = size; // 好像重复了
 	p->page_kind = kind;
 	p->bmp = NULL;
 
@@ -405,11 +412,13 @@ static gc_pheader *gc_alloc_page( int size, int kind, int block_count ) {
 	gc_stats.pages_allocated++;
 	gc_stats.pages_blocks += block_count;
 	gc_stats.pages_total_memory += size;
-	gc_stats.mark_bytes += (block_count + 7) >> 3;
+	gc_stats.mark_bytes += (block_count + 7) >> 3; // 平均每8个块占 1 字节, 最后超出不足 8 也占 1 字节
 
 	// register page in page map
 	int i;
 	for(i=0;i<size>>GC_MASK_BITS;i++) {
+		//这里至少会执行一次, 因为页最小是 64KB,  当 size 为 64KB 的 N 倍时, 如 128KB, 则二次
+		// 当某次 mark() 后, 如果 地址所在值在大于页64KB的位置, 也能正确找到基址, size 必须为 64KB的整倍数
 		void *ptr = p->base + (i<<GC_MASK_BITS);
 		if( GC_GET_LEVEL1(ptr) == gc_level1_null ) {
 			gc_pheader **level = (gc_pheader**)malloc(sizeof(void*) * (1<<GC_LEVEL1_BITS));
@@ -426,6 +435,7 @@ static void gc_free_page( gc_pheader *ph, int block_count ) {
 	int i;
 	for(i=0;i<ph->page_size>>GC_MASK_BITS;i++) {
 		void *ptr = ph->base + (i<<GC_MASK_BITS);
+		// 只是移除最终的页即可, 保留 LEVEL1[256] 数组
 		GC_GET_PAGE(ptr) = NULL;
 	}
 	gc_stats.pages_count--;
@@ -625,7 +635,7 @@ static void gc_mark() {
 		if( !page || !INPAGE(p,page) ) continue; // the value was set to a not gc allocated ptr
 		int bid = gc_allocator_get_block_id(page, p);
 		if( bid >= 0 && (page->bmp[bid>>3] & (1<<(bid&7))) == 0 ) {
-			page->bmp[bid>>3] |= 1<<(bid&7);
+			page->bmp[bid>>3] |= 1<<(bid&7);     // 从右往左的方向标记, 因为低地址在最低位.
 			GC_PUSH_GEN(p,page);
 		}
 	}

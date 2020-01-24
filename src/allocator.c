@@ -43,38 +43,56 @@ static inline unsigned int TRAILING_ZEROES( unsigned int x ) {
 	return x ? __builtin_ctz(x) : 32;
 }
 #endif
-
+// 不同块大小分区的"数量",  见 GC_SIZES
 #define GC_PARTITIONS	9
+
+//
 #define GC_PART_BITS	4
+
+// 用于固定块的数量, 见 GC_SIZES 前 5 个元素
 #define GC_FIXED_PARTS	5
+
+// 用于可变块, 即后边 4 个元素分别是 1 的左移, 使其与 GC_SIZES 内的值相匹配
 static const int GC_SBITS[GC_PARTITIONS] = {0,0,0,0,0,		3,6,14,22};
 
 #ifdef HL_64
 static const int GC_SIZES[GC_PARTITIONS] = {8,16,24,32,40,	8,64,1<<14,1<<22};
 #	define GC_ALIGN_BITS		3
 #else
+// 不同块的"大小", 前 5 固定, 后 4 可变
 static const int GC_SIZES[GC_PARTITIONS] = {4,8,12,16,20,	8,64,1<<14,1<<22};
+
+// 将要对齐大小的 "位移值"
 #	define GC_ALIGN_BITS		2
 #endif
 
-
+// 每个页的有自己的"块大小" 与 不同"类型"(DYNAMIC, RAW, NOPTR, FINALIZER), 9 * 4 = 36 个, 页是链表元素.
 #define GC_ALL_PAGES	(GC_PARTITIONS << PAGE_KIND_BITS)
+
+// 将要对齐的"大小"
 #define	GC_ALIGN		(1 << GC_ALIGN_BITS)
 
+// 页头数组, 可通过 "(part << PAGE_KIND_BITS) | kind" 计算出相应的页头
 static gc_pheader *gc_pages[GC_ALL_PAGES] = {NULL};
+
+// 用于表示所属的单个页有多少个可用块,  (感觉好像没什么用)
 static int gc_free_blocks[GC_ALL_PAGES] = {0};
+
+// 表示当前具有空块的页头
 static gc_pheader *gc_free_pages[GC_ALL_PAGES] = {NULL};
 
-
+// 申请新的"页头", 参数 block 是分区块的大小, 不是块数量, size 默认是 64KB, 但可变块可能会更大, 如果某个申请的值非常大的话
 static gc_pheader *gc_allocator_new_page( int pid, int block, int size, int kind, bool varsize ) {
 	// increase size based on previously allocated pages
 	if( block < 256 ) {
 		int num_pages = 0;
 		gc_pheader *ph = gc_pages[pid];
+		// 这个循环只用于计算 num_pages 的值, 即 List::Length(ph)
 		while( ph ) {
 			num_pages++;
 			ph = ph->next_page;
 		}
+		// 当页数量大于 8 时, 增加 size 值, 以避免后续将会出现太多的页, 即每一个页的页大小并非一致.
 		while( num_pages > 8 && (size<<1) / block <= GC_PAGE_SIZE ) {
 			size <<= 1;
 			num_pages /= 3;
@@ -92,8 +110,8 @@ static gc_pheader *gc_allocator_new_page( int pid, int block, int size, int kind
 	p->sizes = NULL;
 	if( p->max_blocks > GC_PAGE_SIZE )
 		hl_fatal("Too many blocks for this page");
-	if( varsize ) {
-		if( p->max_blocks <= 8 )
+	if( varsize ) {                     // 可变块的"块大小"为 8, 64, 16KB, 4MB
+		if( p->max_blocks <= 8 )        // 如果块的"数量" <= 8, 则不从 base 里划分出 sizes
 			p->sizes = (unsigned char*)&p->sizes_ref;
 		else {
 			p->sizes = ph->base + start_pos;
@@ -101,9 +119,9 @@ static gc_pheader *gc_allocator_new_page( int pid, int block, int size, int kind
 		}
 		MZERO(p->sizes,p->max_blocks);
 	}
-	int m = start_pos % block;
-	if( m ) start_pos += block - m;
-	p->first_block = start_pos / block;
+	int m = start_pos % block;          // 检测划分了 sizes 的 start_pos 是否能整除"块的大小", 全部以"块"为单位
+	if( m ) start_pos += block - m;     // 如果有余数, 则将起始位置对齐至 block 的整倍数(至少是8)
+	p->first_block = start_pos / block; // 常量, 以"块"为单位
 	p->next_block = p->first_block;
 	p->free_blocks = p->max_blocks - p->first_block;
 
@@ -113,6 +131,7 @@ static gc_pheader *gc_allocator_new_page( int pid, int block, int size, int kind
 	return ph;
 }
 
+// 固定页分配, PAGE->next_page 一直为 NULL, 当整个页没有活动块时(由 is_zero 检测), 回收整个页
 static void *gc_alloc_fixed( int part, int kind ) {
 	int pid = (part << PAGE_KIND_BITS) | kind;
 	gc_pheader *ph = gc_free_pages[pid];
@@ -120,18 +139,18 @@ static void *gc_alloc_fixed( int part, int kind ) {
 	unsigned char *ptr;
 	while( ph ) {
 		p = &ph->alloc;
-		if( ph->bmp ) {
-			int next = p->next_block;
+		if( ph->bmp ) {                            // 在 mark_before 时 ph->bmp 才会被划分
+			int next = p->next_block;              // 在 mark_before 时将会重置 next_block 的值为 first_block
 			while( true ) {
 				unsigned int fetch_bits = ((unsigned int*)ph->bmp)[next >> 5];
 				int ones = TRAILING_ONES(fetch_bits >> (next&31));
 				next += ones;
-				if( (next&31) == 0 && ones ) {
-					if( next >= p->max_blocks ) {
+				if( (next&31) == 0 && ones ) {     // true 则说明处于 Int32 的边界处, 需要后续的数据
+					if( next >= p->max_blocks ) {  // 如果超出 max 则跳出换下一"页"
 						p->next_block = next;
 						break;
 					}
-					continue;
+					continue;                      // 读下一个数
 				}
 				p->next_block = next;
 				if( next >= p->max_blocks )
@@ -142,7 +161,7 @@ static void *gc_alloc_fixed( int part, int kind ) {
 			break;
 		ph = ph->next_page;
 	}
-	if( ph == NULL )
+	if( ph == NULL )                               // 申请的新"页"将会自动添加到 gc_free[pid] 中
 		ph = gc_allocator_new_page(pid, GC_SIZES[part], GC_PAGE_SIZE, kind, false);
 alloc_fixed:
 	p = &ph->alloc;
@@ -170,13 +189,13 @@ static void *gc_alloc_var( int part, int size, int kind ) {
 	gc_allocator_page_data *p;
 	unsigned char *ptr;
 	int nblocks = size >> GC_SBITS[part];
-	int max_free = gc_free_blocks[pid];
+	int max_free = gc_free_blocks[pid]; // max_free 记录了系列页(pid)最大的 free_blocks, 但好像并没有起到什么作用
 loop:
 	while( ph ) {
 		p = &ph->alloc;
 		if( ph->bmp ) {
 			int next, avail = 0;
-			if( p->free_blocks >= nblocks ) {
+			if( p->free_blocks >= nblocks ) {  // 当有足够的空块时, 从头开始扫描, TODO: 但是好像在 mark_before 已经处理过了
 				p->next_block = p->first_block;
 				p->free_blocks = 0;
 			}
@@ -188,40 +207,40 @@ loop:
 				unsigned int fetch_bits = ((unsigned int*)ph->bmp)[fid];
 				int bits;
 resume:
-				bits = TRAILING_ONES(fetch_bits >> (next&31));
+				bits = TRAILING_ONES(fetch_bits >> (next&31)); // 扫描活动块,
 				if( bits ) {
-					if( avail > p->free_blocks ) p->free_blocks = avail;
+					if( avail > p->free_blocks ) p->free_blocks = avail; // ??? 更新 free_blocks 的值
 					avail = 0;
 					next += bits - 1;
-					if( next >= p->max_blocks ) {
+					if( next >= p->max_blocks ) {              // 如果活动块 next 已经超出, 则 goto 跳转检测下一页
 						p->next_block = next;
 						ph = ph->next_page;
 						goto loop;
 					}
 					if( p->sizes[next] == 0 ) hl_fatal("assert");
-					next += p->sizes[next];
-					if( next + nblocks > p->max_blocks ) {
+					next += p->sizes[next];                    // 通过 size 更新 next 位置
+					if( next + nblocks > p->max_blocks ) {     // 如果 next + nblocks 超出, 同样 goto 跳转下一页
 						p->next_block = next;
 						ph = ph->next_page;
 						goto loop;
 					}
-					if( (next>>5) != fid )
+					if( (next>>5) != fid )                     // 如果 true , 则需要从下一个 fid 开始.
 						continue;
-					goto resume;
+					goto resume;                               // 继续扫描活动块
 				}
 				bits = TRAILING_ZEROES( (next & 31) ? (fetch_bits >> (next&31)) | (1<<(32-(next&31))) : fetch_bits );
 				avail += bits;
 				next += bits;
-				if( next > p->max_blocks ) {
+				if( next > p->max_blocks ) {                   //
 					avail -= next - p->max_blocks;
 					next = p->max_blocks;
 					if( avail < nblocks ) break;
 				}
-				if( avail >= nblocks ) {
+				if( avail >= nblocks ) {                       //
 					p->next_block = next - avail;
 					goto alloc_var;
 				}
-				if( next & 31 ) goto resume;
+				if( next & 31 ) goto resume;                   //
 			}
 			if( avail > p->free_blocks ) p->free_blocks = avail;
 			p->next_block = next;
@@ -269,7 +288,7 @@ alloc_var:
 	} else {
 		p->free_blocks = p->max_blocks - (p->next_block + nblocks);
 	}
-	if( nblocks > 1 ) MZERO(p->sizes + p->next_block, nblocks);
+	if( nblocks > 1 ) MZERO(p->sizes + p->next_block, nblocks); // 为什么只有 1 个块时不清 0 了?
 	p->sizes[p->next_block] = (unsigned char)nblocks;
 	p->next_block += nblocks;
 	gc_free_pages[pid] = ph;
@@ -309,6 +328,7 @@ static bool is_zero( void *ptr, int size ) {
 	return memcmp(p,ZEROMEM,size) == 0;
 }
 
+// 如果整页的 bmp 都为 0, 则当成空页回收到 free_page 链表
 static void gc_flush_empty_pages() {
 	int i;
 	for(i=0;i<GC_ALL_PAGES;i++) {
@@ -365,6 +385,7 @@ static void gc_clear_unmarked_mem() {
 }
 #endif
 
+
 static void gc_call_finalizers(){
 	int i;
 	for(i=MEM_KIND_FINALIZER;i<GC_ALL_PAGES;i+=1<<PAGE_KIND_BITS) {
@@ -374,7 +395,7 @@ static void gc_call_finalizers(){
 			gc_allocator_page_data *p = &ph->alloc;
 			for(bid=p->first_block;bid<p->max_blocks;bid++) {
 				int size = p->sizes[bid];
-				if( !size ) continue;
+				if( !size ) continue; // TODO: if( p->sizes[bid] && (ph->bmp[bid>>3] & (1<<(bid&7))) == 0 )
 				if( (ph->bmp[bid>>3] & (1<<(bid&7))) == 0 ) {
 					unsigned char *ptr = ph->base + bid * p->block_size;
 					void *finalizer = *(void**)ptr;
@@ -422,7 +443,7 @@ static int gc_allocator_get_block_id( gc_pheader *page, void *block ) {
 	if( offset%page->alloc.block_size != 0 )
 		return -1;
 	int bid = offset / page->alloc.block_size;
-	if( page->alloc.sizes && page->alloc.sizes[bid] == 0 ) return -1;
+	if( page->alloc.sizes && page->alloc.sizes[bid] == 0 ) return -1; // 如果是 "固定块" 那么 page->alloc.sizes 的值将为 NULL
 	return bid;
 }
 
