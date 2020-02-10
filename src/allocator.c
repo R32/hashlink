@@ -64,9 +64,13 @@ static const int GC_SIZES[GC_PARTITIONS] = {4,8,12,16,20,	8,64,1<<13,0};
 #define	GC_ALIGN		(1 << GC_ALIGN_BITS)
 
 static gc_pheader *gc_pages[GC_ALL_PAGES] = {NULL};
-static int gc_free_blocks[GC_ALL_PAGES] = {0};
 static gc_pheader *gc_free_pages[GC_ALL_PAGES] = {NULL};
 
+#define GC_FL_MAX 9
+static void* gc_freelist[GC_LARGE_PART - GC_FIXED_PARTS][(1 << PAGE_KIND_BITS) - 1][GC_FL_MAX + 1] = { NULL };
+static const int gc_freelist_starts[GC_PARTITIONS] = {0,0,0,0,0,	3,32,2,0};
+#define GC_FL_HEAD(part, kind) (gc_freelist[((part) - GC_FIXED_PARTS)][kind])
+#define GC_FL_OFFSET(part, nblocks) ((nblocks) - gc_freelist_starts[part])
 
 static gc_pheader *gc_allocator_new_page( int pid, int block, int size, int kind, bool varsize ) {
 	// increase size based on previously allocated pages
@@ -107,7 +111,6 @@ static gc_pheader *gc_allocator_new_page( int pid, int block, int size, int kind
 	if( m ) start_pos += block - m;
 	p->first_block = start_pos / block;
 	p->next_block = p->first_block;
-	p->free_blocks = p->max_blocks - p->first_block;
 
 	ph->next_page = gc_pages[pid];
 	gc_pages[pid] = ph;
@@ -172,16 +175,11 @@ static void *gc_alloc_var( int part, int size, int kind ) {
 	gc_allocator_page_data *p;
 	unsigned char *ptr;
 	int nblocks = size >> GC_SBITS[part];
-	int max_free = gc_free_blocks[pid];
 loop:
 	while( ph ) {
 		p = &ph->alloc;
 		if( ph->bmp ) {
 			int next, avail = 0;
-			if( p->free_blocks >= nblocks ) {
-				p->next_block = p->first_block;
-				p->free_blocks = 0;
-			}
 			next = p->next_block;
 			if( next + nblocks > p->max_blocks )
 				goto skip;
@@ -192,7 +190,22 @@ loop:
 resume:
 				bits = TRAILING_ONES(fetch_bits >> (next&31));
 				if( bits ) {
-					if( avail > p->free_blocks ) p->free_blocks = avail;
+					if (avail && kind != MEM_KIND_FINALIZER) {
+						int index = GC_FL_OFFSET(part, avail);
+						if (index >= 0) {
+							int bid = next - avail;
+							MZERO(p->sizes + bid, avail);
+							p->sizes[bid] = (unsigned char)avail;
+							ptr = ph->base + (bid << GC_SBITS[part]);
+							if (index > GC_FL_MAX) {
+								index = GC_FL_MAX;
+								((void**)ptr)[1] = (void*)avail;
+							}
+							void** head = GC_FL_HEAD(part, kind);
+							*(void**)ptr = head[index];  // ptr.next = *head
+							head[index] = ptr;           // *head = ptr;
+						}
+					}
 					avail = 0;
 					next += bits - 1;
 					if( next >= p->max_blocks ) {
@@ -225,18 +238,11 @@ resume:
 				}
 				if( next & 31 ) goto resume;
 			}
-			if( avail > p->free_blocks ) p->free_blocks = avail;
 			p->next_block = next;
 		} else if( p->next_block + nblocks <= p->max_blocks )
 			break;
 skip:
-		if( p->free_blocks > max_free )
-			max_free = p->free_blocks;
 		ph = ph->next_page;
-		if( ph == NULL && max_free >= nblocks ) {
-			max_free = 0;
-			ph = gc_pages[pid];
-		}
 	}
 	if( ph == NULL ) {
 		int psize = GC_PAGE_SIZE;
@@ -246,7 +252,7 @@ skip:
 	}
 alloc_var:
 	p = &ph->alloc;
-	ptr = ph->base + p->next_block * p->block_size;
+	ptr = ph->base + (p->next_block << GC_SBITS[part]);
 #	ifdef GC_DEBUG
 	{
 		int i;
@@ -256,54 +262,96 @@ alloc_var:
 			if( ptr[i] != 0xDD )
 				hl_fatal("assert");
 	}
-#	endif
 	if( ph->bmp ) {
 		int bid = p->next_block;
-#		ifdef GC_DEBUG
 		int i;
 		for(i=0;i<nblocks;i++) {
 			if( (ph->bmp[bid>>3]&(1<<(bid&7))) != 0 ) hl_fatal("Alloc on marked block");
 			bid++;
 		}
-		bid = p->next_block;
-#		endif
-		ph->bmp[bid>>3] |= 1<<(bid&7);
-	} else {
-		p->free_blocks = p->max_blocks - (p->next_block + nblocks);
 	}
+#	endif
 	if( nblocks > 1 ) MZERO(p->sizes + p->next_block, nblocks);
 	p->sizes[p->next_block] = (unsigned char)nblocks;
 	p->next_block += nblocks;
 	gc_free_pages[pid] = ph;
-	gc_free_blocks[pid] = max_free;
 	return ptr;
 }
 
-static void *gc_allocator_alloc( int *size, int page_kind ) {
+static int gc_allocator_sizes(int *size, int page_kind) {
+	int part = GC_FIXED_PARTS;
 	int sz = *size;
-	sz += (-sz) & (GC_ALIGN - 1);
-	if( sz >= GC_LARGE_BLOCK ) {
-		sz += (-sz) & (GC_PAGE_SIZE - 1);
-		*size = sz;
-		gc_pheader *ph = gc_allocator_new_page((GC_LARGE_PART << PAGE_KIND_BITS) | page_kind,sz,sz,page_kind,false);
-		return ph->base;
-	}
-	if( sz <= GC_SIZES[GC_FIXED_PARTS-1] && page_kind != MEM_KIND_FINALIZER ) {
-		int part = (sz >> GC_ALIGN_BITS) - 1;
+	if (sz <= GC_SIZES[GC_FIXED_PARTS - 1] && page_kind != MEM_KIND_FINALIZER) {
+		sz += (-sz) & (GC_ALIGN - 1);
+		part = (sz >> GC_ALIGN_BITS) - 1;
 		*size = GC_SIZES[part];
-		return gc_alloc_fixed(part, page_kind);
+	} else if (sz < (GC_SIZES[GC_FIXED_PARTS] * 255)) {
+		sz += (-sz) & (GC_SIZES[GC_FIXED_PARTS] - 1);
+		*size = sz;
+	} else if (sz < (GC_SIZES[GC_FIXED_PARTS + 1] * 255)) {
+		sz += (-sz) & (GC_SIZES[GC_FIXED_PARTS + 1] - 1);
+		part++;
+		*size = sz;
+	} else if (sz >= GC_LARGE_BLOCK) {
+		sz += (-sz) & (GC_PAGE_SIZE - 1);
+		part = GC_LARGE_PART;
+		*size = sz;
+	} else {
+		sz += (-sz) & (GC_SIZES[GC_FIXED_PARTS + 2] - 1);
+		part = GC_FIXED_PARTS + 2;
+		*size = sz;
 	}
-	int p;
-	for(p=GC_FIXED_PARTS;p<GC_PARTITIONS;p++) {
-		int block = GC_SIZES[p];
-		int query = sz + ((-sz) & (block - 1));
-		if( query < block * 255 ) {
-			*size = query;
-			return gc_alloc_var(p, query, page_kind);
+	return part;
+}
+
+static void* gc_freelist_pickup(int* allocated, int part, int kind) {
+	if (!(part >= GC_FIXED_PARTS && part < GC_LARGE_PART && kind != MEM_KIND_FINALIZER))
+		return NULL;
+	int nblocks = *allocated >> GC_SBITS[part];
+	int index = GC_FL_OFFSET(part, nblocks);
+	if (index < GC_FL_MAX) {
+		void** head = GC_FL_HEAD(part, kind);
+		void* cur = head[index];
+		if (cur) {
+			head[index] = *(void**)cur;
+			return cur;
+		}
+	} else {
+		index = GC_FL_MAX;
+		void** head = GC_FL_HEAD(part, kind);
+		void* cur = head[index];
+		void* prev = NULL;
+		while (cur) {
+			int n = (int)((void**)cur)[1];
+			if (n == nblocks || (n > nblocks && n <= nblocks * 2)) {
+				*allocated = n << GC_SBITS[part];
+				if (prev == NULL)
+					head[index] = *(void**)cur;
+				else
+					*(void**)prev = *(void**)cur; // prev.next = cur.next
+				return cur;
+			}
+			prev = cur;
+			cur = *(void**)cur;
 		}
 	}
-	*size = -1;
 	return NULL;
+}
+
+static void *gc_allocator_alloc(int size, int part, int page_kind) {
+	switch (part) {
+	case GC_FIXED_PARTS:
+	case GC_FIXED_PARTS + 1:
+	case GC_FIXED_PARTS + 2:
+		return gc_alloc_var(part, size, page_kind);
+	case GC_LARGE_PART:
+		{
+		gc_pheader *ph = gc_allocator_new_page((GC_LARGE_PART << PAGE_KIND_BITS) | page_kind, size, size, page_kind, false);
+		return ph->base;
+		}
+	default:
+		return gc_alloc_fixed(part, page_kind);
+	}
 }
 
 static bool is_zero( void *ptr, int size ) {
@@ -404,15 +452,14 @@ static void gc_allocator_before_mark( unsigned char *mark_cur ) {
 	for(pid=0;pid<GC_ALL_PAGES;pid++) {
 		gc_pheader *p = gc_pages[pid];
 		gc_free_pages[pid] = p;
-		gc_free_blocks[pid] = 0;
 		while( p ) {
 			p->bmp = mark_cur;
 			p->alloc.next_block = p->alloc.first_block;
-			p->alloc.free_blocks = 0;
 			mark_cur += (p->alloc.max_blocks + 7) >> 3;
 			p = p->next_page;
 		}
 	}
+	MZERO(gc_freelist, sizeof(gc_freelist));
 }
 
 #define gc_allocator_fast_block_size(page,block) \

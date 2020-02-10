@@ -455,19 +455,21 @@ static void gc_free_page( gc_pheader *ph, int block_count ) {
 static void gc_check_mark();
 
 void *hl_gc_alloc_gen( hl_type *t, int size, int flags ) {
-	void *ptr;
-	int time = 0;
-	int allocated = 0;
-	if( size == 0 )
+	if (size == 0)
 		return NULL;
-	gc_global_lock(true);
-	gc_check_mark();
 #	ifdef GC_MEMCHK
 	size += HL_WSIZE;
 #	endif
+	int time = 0;
+	int allocated = size;
+	int page_kind = flags & PAGE_KIND_MASK;
+	int part = gc_allocator_sizes(&allocated, page_kind);
+	gc_global_lock(true);
+	void *ptr = gc_freelist_pickup(&allocated, part, page_kind);
+	if (ptr == NULL)
+		gc_check_mark();
 	if( gc_flags & GC_PROFILE ) time = TIMESTAMP();
 	{
-		allocated = size;
 		gc_stats.allocation_count++;
 		gc_stats.total_requested += size;
 #		ifdef GC_PRINT_ALLOCS_SIZES
@@ -495,12 +497,10 @@ void *hl_gc_alloc_gen( hl_type *t, int size, int flags ) {
 			printf("%d\n",gc_stats.allocation_count);
 		}
 #		endif
-		ptr = gc_allocator_alloc(&allocated,flags & PAGE_KIND_MASK);
+		if (ptr == NULL)
+			ptr = gc_allocator_alloc(allocated, part, page_kind);
 		if( ptr == NULL ) {
-			if( allocated < 0 ) {
-				gc_global_lock(false);
-				hl_error("Required memory allocation too big");
-			}
+			gc_global_lock(false);
 			hl_fatal("TODO");
 		}
 		gc_stats.total_allocated += allocated;
